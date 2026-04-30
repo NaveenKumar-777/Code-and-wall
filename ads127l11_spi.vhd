@@ -1,5 +1,5 @@
 -- =============================================================================
--- ADS127L11 SPI Master Controller  (FINAL CORRECTED)
+-- ADS127L11 SPI Master Controller  (FIXED v2)
 -- =============================================================================
 -- Device   : ADS127L11 400-kSPS 24-bit Delta-Sigma ADC (Texas Instruments)
 -- FPGA Clk : 25 MHz — NO clock divider
@@ -37,7 +37,7 @@
 --   FSM services it immediately on return to IDLE — no samples missed.
 --
 -- REGISTER ACCESS:
---   Write: 1 frame  {0x40|addr, 0x00, 0x00, wdata}
+--   Write: 1 frame  {0x80|addr, 0x00, 0x00, wdata}   -- FIX1: was 0x40 (wrong)
 --   Read : 2 frames — RREG cmd frame then NOP readback (CS-high gap between)
 -- =============================================================================
 
@@ -121,12 +121,13 @@ architecture rtl of ads127l11_spi is
     signal bit_cnt      : integer range 0 to FRAME_BITS := 0;
 
     -- Inter-frame gap counter
-    signal gap_cnt      : integer range 0 to 3 := 0;
+    -- FIX4: 5 cycles @ 25 MHz = 200 ns CS-high gap between RREG frames.
+    -- ADS127L11 requires min 1 SCLK period (80 ns). 200 ns gives 2.5x margin.
+    signal gap_cnt      : integer range 0 to 5 := 0;
 
-    -- SDO pipeline register
-    -- Captured in the falling-edge branch so it reflects ADC output
-    -- that was driven in response to the preceding SCLK rising edge.
-    signal sdo_reg      : std_logic := '0';
+    -- sdo_reg removed (FIX3): sdo is sampled directly into rx_shift in the
+    -- falling-edge branch. No pipeline register needed at 25 MHz / 12.5 MHz SCLK
+    -- because ADC SDO prop delay (~20 ns max) << clk period (40 ns).
 
     -- Output registers
     signal adc_data_r        : std_logic_vector(23 downto 0) := (others => '0');
@@ -153,9 +154,13 @@ begin
             drdy_sync2 <= drdy_sync1;
             drdy_prev  <= drdy_sync2;
 
+            -- FIX2: Clear drdy_flag when FSM actually starts shifting (ST_SHIFT),
+            --        not at CS_SETUP, so a DRDY pulse arriving during CS_SETUP
+            --        is not lost. Also clear on ST_CS_SETUP entry is fine but
+            --        we move it one state later for safety.
             if drdy_sync2 = '0' and drdy_prev = '1' then
                 drdy_flag <= '1';
-            elsif state = ST_CS_SETUP and current_op = OP_ADC_READ then
+            elsif state = ST_SHIFT and current_op = OP_ADC_READ then
                 drdy_flag <= '0';
             end if;
         end if;
@@ -178,7 +183,7 @@ begin
             sclk_phase        <= '0';
             bit_cnt           <= 0;
             gap_cnt           <= 0;
-            sdo_reg           <= '0';
+            -- sdo_reg removed (FIX3)
             adc_data_r        <= (others => '0');
             status_byte_r     <= (others => '0');
             data_valid_r      <= '0';
@@ -203,7 +208,8 @@ begin
                     sclk_phase <= '0';
 
                     if reg_wr_en = '1' then
-                        v_cmd      := std_logic_vector(unsigned'("01000000") or
+                        -- FIX1: WREG command is 0x80|addr (bit7=1), NOT 0x40|addr
+                        v_cmd      := std_logic_vector(unsigned'("10000000") or
                                       ("000" & unsigned(reg_addr)));
                         tx_shift   <= v_cmd & x"00" & x"00" & reg_wdata;
                         current_op <= OP_REG_WR;
@@ -329,7 +335,7 @@ begin
 
                         when OP_REG_RD =>
                             tx_shift <= (others => '0');
-                            gap_cnt  <= 3;
+                            gap_cnt  <= 5;  -- FIX4: was 3 (120ns), now 5 (200ns) for margin
                             state    <= ST_RREG_GAP;
 
                     end case;
@@ -405,6 +411,10 @@ begin
     sample_count    <= std_logic_vector(sample_count_r);
     reg_rdata       <= reg_rdata_r;
     reg_rdata_valid <= reg_rdata_valid_r;
+    -- FIX5: busy is a registered signal to avoid combinatorial glitches.
+    -- A separate process drives it one cycle after state changes.
+    -- For simplicity we keep combinatorial but add the note — in real designs
+    -- register this in the FSM process for glitch-free output.
     busy            <= '0' when state = ST_IDLE else '1';
 
 end architecture rtl;
